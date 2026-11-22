@@ -1,5 +1,3 @@
-taskkill /F /IM python.exe 2>$null
-@'
 import os
 import re
 import json
@@ -12,7 +10,7 @@ import urllib.request
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, parse_qs
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 PORTA_SERVIDOR = 9090
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -38,9 +36,6 @@ FABRICANTES = {
     "24:0A:C4": "Espressif (ESP32)", "30:AE:A4": "Espressif (ESP32)"
 }
 
-# ==========================================
-# REDE, GEOLOCALIZAÇÃO E TELEMETRIA
-# ==========================================
 def obter_ip_local():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -56,7 +51,7 @@ def consultar_geo_api(ip=""):
     try:
         alvo = f"/{ip}" if ip else ""
         url = f"http://ip-api.com{alvo}?fields=status,query,country,countryCode,regionName,city,isp,as,lat,lon"
-        req = urllib.request.urlopen(url, timeout=2.0)
+        req = urllib.request.urlopen(url, timeout=1.5)
         dados = json.loads(req.read().decode("utf-8"))
         if dados.get("status") == "success":
             return dados
@@ -87,7 +82,7 @@ def obter_localizacao_completa(ip):
         CACHE_GEO[ip] = loc
         return loc
 
-    return "Origem Externa (Não identificada)"
+    return "Origem Externa"
 
 def carregar_logs():
     if os.path.exists(ARQUIVO_LOGS):
@@ -158,12 +153,9 @@ def obter_mac_por_ip(ip_alvo):
         pass
     return "Externo / Oculto"
 
-# ==========================================
-# FERRAMENTAS DE AUDITORIA & REDE
-# ==========================================
 def ping_ip(ip):
     param = "-n" if platform.system().lower() == "windows" else "-c"
-    timeout = ["-w", "250"] if platform.system().lower() == "windows" else ["-W", "1"]
+    timeout = ["-w", "200"] if platform.system().lower() == "windows" else ["-W", "1"]
     subprocess.run(["ping", param, "1", *timeout, ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def varredura_ativa(ip_local):
@@ -171,7 +163,7 @@ def varredura_ativa(ip_local):
         return
     base = ".".join(ip_local.split(".")[:3])
     ips = [f"{base}.{i}" for i in range(1, 255)]
-    with ThreadPoolExecutor(max_workers=60) as executor:
+    with ThreadPoolExecutor(max_workers=80) as executor:
         executor.map(ping_ip, ips)
 
 def porta_aberta(ip, porta):
@@ -185,16 +177,9 @@ def identificar_fabricante(mac):
     prefixo = mac[:8]
     if prefixo in FABRICANTES:
         return FABRICANTES[prefixo]
-    if mac[1:2] in ["2", "6", "A", "E"]:
+    if len(mac) > 1 and mac in ["2", "6", "A", "E"]:
         return "MAC Privado (Celular)"
     return "Genérico"
-
-def obter_hostname(ip):
-    try:
-        nome, _, _ = socket.gethostbyaddr(ip)
-        return nome.split(".").pop(0)
-    except Exception:
-        return "—"
 
 def listar_dispositivos(ip_local):
     dispositivos = []
@@ -205,9 +190,8 @@ def listar_dispositivos(ip_local):
             if ip.startswith(base) and not ip.endswith((".255", ".0")):
                 mac_fmt = mac.replace("-", ":").upper()
                 fab = identificar_fabricante(mac_fmt)
-                host = obter_hostname(ip)
-                funcao = "Gateway" if ip.endswith(".1") else "Host LAN"
-                dispositivos.append({"ip": ip, "host": host, "mac": mac_fmt, "fab": fab, "funcao": funcao})
+                funcao = "Gateway / Roteador" if ip.endswith(".1") else "Host LAN"
+                dispositivos.append({"ip": ip, "mac": mac_fmt, "fab": fab, "funcao": funcao})
     except Exception:
         pass
     return dispositivos
@@ -218,26 +202,25 @@ def obter_conexoes_externas():
         saida = subprocess.check_output("netstat -ano -p TCP", shell=True).decode(errors="ignore")
         for linha in saida.splitlines():
             partes = linha.split()
-            if len(partes) >= 5 and partes[3] == "ESTABLISHED":
-                local_addr = partes[1]
-                remoto_addr = partes[2]
-                pid = partes[4]
+            if len(partes) >= 5 and partes == "ESTABLISHED":
+                remoto_addr = partes
+                pid = partes
                 if not remoto_addr.startswith(("127.", "192.168.", "10.", "[::1]")):
-                    conexoes.append({"local": local_addr, "remoto": remoto_addr, "pid": pid})
+                    conexoes.append({"remoto": remoto_addr, "pid": pid})
     except Exception:
         pass
     return conexoes[:15]
 
 def investigar_alvo_osint(alvo):
-    alvo = alvo.strip().replace("https://", "").replace("http://", "").split("/").pop(0)
+    alvo = alvo.strip().replace("https://", "").replace("http://", "").split("/")
     try:
         ip_resolvido = socket.gethostbyname(alvo)
     except Exception:
-        return {"erro": f"Não foi possível resolver o domínio/IP: {alvo}"}
+        return {"erro": f"Não foi possível resolver: {alvo}"}
 
     dados = consultar_geo_api(ip_resolvido)
     if not dados:
-        return {"erro": f"Sem dados públicos disponíveis para {ip_resolvido}"}
+        return {"erro": f"Sem dados públicos para {ip_resolvido}"}
 
     return {
         "alvo": alvo,
@@ -248,21 +231,12 @@ def investigar_alvo_osint(alvo):
         "coords": f"{dados.get('lat')}, {dados.get('lon')}"
     }
 
-# ==========================================
-# UI / DESIGN MINIMALISTA PROFISSIONAL
-# ==========================================
 CSS_BASE = """
 <style>
   :root {
-    --bg: #09090b;
-    --surface: #111114;
-    --surface-2: #18181c;
-    --border: #27272a;
-    --text: #f4f4f5;
-    --muted: #a1a1aa;
-    --accent: #3b82f6;
-    --success: #10b981;
-    --danger: #ef4444;
+    --bg: #09090b; --surface: #111114; --surface-2: #18181c;
+    --border: #27272a; --text: #f4f4f5; --muted: #a1a1aa;
+    --accent: #3b82f6; --success: #10b981; --danger: #ef4444;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -278,4 +252,12 @@ CSS_BASE = """
   .brand { font-size: 16px; font-weight: 600; letter-spacing: -0.02em; display: flex; align-items: center; gap: 10px; }
   .dot { width: 8px; height: 8px; background: var(--success); border-radius: 50%; box-shadow: 0 0 8px var(--success); }
   .nav-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .grid-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 28px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 24px; }
+  .grid-stats .card { margin-bottom: 0; }
+  .card-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }
+  .card-value { font-size: 20px; font-weight: 600; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; gap: 12px; flex-wrap: wrap; }
+  .section-title { font-size: 15px; font-weight: 600; }
+  .sub-text { font-size: 12px; color: var(--muted); }
 
