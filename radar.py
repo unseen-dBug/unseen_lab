@@ -1,40 +1,46 @@
-import socket
-import subprocess
-import platform
-import re
+taskkill /F /IM python.exe 2>$null
+@'
 import os
+import re
+import json
+import socket
+import platform
 import threading
+import subprocess
 import webbrowser
+import urllib.request
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+PORTA_SERVIDOR = 9090
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ARQUIVO_LOGS = os.path.join(BASE_DIR, "access_logs.json")
+CACHE_GEO = {}
+GEO_GATEWAY_CACHE = None
 
 PORTAS_ALVO = {
-    21: "FTP", 22: "SSH", 23: "Telnet", 53: "DNS",
-    80: "HTTP (Painel Web)", 135: "RPC (Windows)", 139: "NetBIOS",
-    443: "HTTPS", 445: "SMB (Arquivos PC)", 554: "RTSP (Camera)",
-    3000: "LG WebOS TV", 3389: "RDP (Acesso Remoto)",
-    5555: "ADB (Android/TV Box)", 8001: "Samsung Smart TV",
-    8008: "Chromecast / Android TV", 8080: "HTTP-Alt",
-    62078: "Apple iPhone/iPad"
+    21: "FTP", 22: "SSH", 53: "DNS", 80: "HTTP",
+    135: "RPC", 443: "HTTPS", 445: "SMB", 554: "RTSP",
+    3000: "WebOS TV", 3389: "RDP", 8001: "Samsung TV",
+    8008: "Chromecast", 8080: "HTTP-Alt", 62078: "iOS Sync"
 }
 
 FABRICANTES = {
     "28:6C:07": "Xiaomi", "64:CC:2E": "Xiaomi", "F8:A4:5F": "Xiaomi", "50:EC:50": "Xiaomi",
-    "BC:30:7E": "Samsung", "D0:22:BE": "Samsung", "A8:7C:01": "Samsung", "8C:71:F8": "Samsung", "5C:49:7D": "Samsung",
-    "3C:22:FB": "Apple", "F0:18:98": "Apple", "AC:BC:32": "Apple", "DC:2B:2A": "Apple", "A4:83:E7": "Apple",
-    "40:78:6A": "Motorola", "E4:90:7E": "Motorola", "9C:D9:17": "Motorola", "CC:C3:EA": "Motorola",
-    "00:1E:75": "LG Electronics", "64:99:5D": "LG Electronics", "AC:0D:1B": "LG Electronics",
-    "F4:F5:D8": "Google/Chromecast", "54:60:09": "Google/Nest",
-    "50:C7:BF": "TP-Link", "C0:25:E9": "TP-Link", "E8:48:B8": "TP-Link", "98:DA:C4": "TP-Link",
-    "00:1E:42": "Intelbras", "38:6B:1C": "Intelbras", "78:98:E8": "D-Link",
-    "00:E0:FC": "Huawei", "48:46:FB": "Huawei", "70:8C:B6": "Huawei",
-    "54:22:F8": "ZTE", "74:A7:8E": "ZTE", "D4:37:D7": "Fiberhome", "4C:1B:86": "Nokia",
-    "24:0A:C4": "Espressif (ESP32)", "30:AE:A4": "Espressif (ESP32)", "A4:CF:12": "Espressif (ESP32)",
-    "B8:27:EB": "Raspberry Pi", "DC:A6:32": "Raspberry Pi", "D8:3A:DD": "Raspberry Pi",
-    "00:50:56": "VMware", "08:00:27": "VirtualBox"
+    "BC:30:7E": "Samsung", "D0:22:BE": "Samsung", "A8:7C:01": "Samsung", "8C:71:F8": "Samsung",
+    "3C:22:FB": "Apple", "F0:18:98": "Apple", "AC:BC:32": "Apple", "DC:2B:2A": "Apple",
+    "40:78:6A": "Motorola", "E4:90:7E": "Motorola", "9C:D9:17": "Motorola",
+    "00:1E:75": "LG", "64:99:5D": "LG", "F4:F5:D8": "Google",
+    "50:C7:BF": "TP-Link", "C0:25:E9": "TP-Link", "00:1E:42": "Intelbras",
+    "00:E0:FC": "Huawei", "54:22:F8": "ZTE", "D4:37:D7": "Fiberhome",
+    "24:0A:C4": "Espressif (ESP32)", "30:AE:A4": "Espressif (ESP32)"
 }
 
+# ==========================================
+# REDE, GEOLOCALIZAÇÃO E TELEMETRIA
+# ==========================================
 def obter_ip_local():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -46,9 +52,118 @@ def obter_ip_local():
         s.close()
     return ip
 
+def consultar_geo_api(ip=""):
+    try:
+        alvo = f"/{ip}" if ip else ""
+        url = f"http://ip-api.com{alvo}?fields=status,query,country,countryCode,regionName,city,isp,as,lat,lon"
+        req = urllib.request.urlopen(url, timeout=2.0)
+        dados = json.loads(req.read().decode("utf-8"))
+        if dados.get("status") == "success":
+            return dados
+    except Exception:
+        pass
+    return None
+
+def obter_localizacao_completa(ip):
+    global GEO_GATEWAY_CACHE
+    eh_local = ip.startswith(("127.", "192.168.", "10.")) or bool(re.match(r"^172\.(1[6-9]|2[0-9]|3[0-1])\.", ip))
+
+    if eh_local:
+        if not GEO_GATEWAY_CACHE:
+            GEO_GATEWAY_CACHE = consultar_geo_api("")
+        if GEO_GATEWAY_CACHE:
+            cidade = GEO_GATEWAY_CACHE.get("city", "Local")
+            estado = GEO_GATEWAY_CACHE.get("regionName", "")
+            pais = GEO_GATEWAY_CACHE.get("countryCode", "BR")
+            return f"Wi-Fi Local ({cidade}, {estado} - {pais})"
+        return "Rede Local (Wi-Fi / LAN)"
+
+    if ip in CACHE_GEO:
+        return CACHE_GEO[ip]
+
+    dados = consultar_geo_api(ip)
+    if dados:
+        loc = f"{dados.get('city')}, {dados.get('regionName')} - {dados.get('country')} ({dados.get('isp')})"
+        CACHE_GEO[ip] = loc
+        return loc
+
+    return "Origem Externa (Não identificada)"
+
+def carregar_logs():
+    if os.path.exists(ARQUIVO_LOGS):
+        try:
+            with open(ARQUIVO_LOGS, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def salvar_log(registro):
+    logs = carregar_logs()
+    logs.insert(0, registro)
+    logs = logs[:300]
+    try:
+        with open(ARQUIVO_LOGS, "w", encoding="utf-8") as f:
+            json.dump(logs, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def analisar_user_agent(ua):
+    if not ua:
+        return "Dispositivo Desconhecido", "Cliente HTTP"
+
+    dispositivo = "Computador Desktop"
+    if "iPhone" in ua:
+        dispositivo = "Apple iPhone"
+    elif "iPad" in ua:
+        dispositivo = "Apple iPad"
+    elif "Samsung" in ua or "SM-" in ua:
+        match = re.search(r"(SM-[A-Z0-9]+)", ua)
+        modelo = f" ({match.group(1)})" if match else ""
+        dispositivo = f"Samsung Galaxy{modelo}"
+    elif any(k in ua for k in ["Redmi", "POCO", "Mi ", "Xiaomi"]):
+        dispositivo = "Xiaomi / Redmi"
+    elif "Moto" in ua or "Motorola" in ua:
+        dispositivo = "Motorola"
+    elif "Android" in ua:
+        dispositivo = "Smartphone Android"
+    elif "Windows" in ua:
+        dispositivo = "PC Windows"
+    elif "Macintosh" in ua or "Mac OS" in ua:
+        dispositivo = "Apple Mac"
+    elif "Linux" in ua:
+        dispositivo = "Sistema Linux"
+
+    navegador = "Navegador"
+    if "Edg/" in ua:
+        navegador = "Edge"
+    elif "OPR/" in ua or "Opera" in ua:
+        navegador = "Opera"
+    elif "Chrome/" in ua and "Safari/" in ua:
+        navegador = "Chrome"
+    elif "Firefox/" in ua:
+        navegador = "Firefox"
+    elif "Safari/" in ua and "Chrome/" not in ua:
+        navegador = "Safari"
+
+    return dispositivo, navegador
+
+def obter_mac_por_ip(ip_alvo):
+    try:
+        saida = subprocess.check_output("arp -a", shell=True).decode(errors="ignore")
+        for ip, mac in re.findall(r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:-]{17})", saida):
+            if ip == ip_alvo:
+                return mac.replace("-", ":").upper()
+    except Exception:
+        pass
+    return "Externo / Oculto"
+
+# ==========================================
+# FERRAMENTAS DE AUDITORIA & REDE
+# ==========================================
 def ping_ip(ip):
     param = "-n" if platform.system().lower() == "windows" else "-c"
-    timeout = ["-w", "300"] if platform.system().lower() == "windows" else ["-W", "1"]
+    timeout = ["-w", "250"] if platform.system().lower() == "windows" else ["-W", "1"]
     subprocess.run(["ping", param, "1", *timeout, ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def varredura_ativa(ip_local):
@@ -67,165 +182,100 @@ def porta_aberta(ip, porta):
     return aberta
 
 def identificar_fabricante(mac):
-    mac_norm = mac.replace("-", ":").upper()
-    prefixo = mac_norm[:8]
+    prefixo = mac[:8]
     if prefixo in FABRICANTES:
-        return FABRICANTES[prefixo], False
-    if mac_norm[1:2] in ["2", "6", "A", "E"]:
-        return "MAC Privado (Celular Moderno)", True
-    return "Desconhecido", False
+        return FABRICANTES[prefixo]
+    if mac[1:2] in ["2", "6", "A", "E"]:
+        return "MAC Privado (Celular)"
+    return "Genérico"
 
 def obter_hostname(ip):
     try:
         nome, _, _ = socket.gethostbyaddr(ip)
         return nome.split(".").pop(0)
     except Exception:
-        return "-"
-
-def classificar_dispositivo(ip, host, fab, mac_privado):
-    h = host.lower()
-    f = fab.lower()
-
-    if ip.endswith(".1"):
-        return "ROTEADOR / GATEWAY"
-
-    if any(k in h for k in ["tv", "bravia", "tizen", "webos", "roku", "fire", "chromecast", "miband", "stick"]):
-        return "SMART TV / STREAMING"
-    if any(k in h for k in ["iphone", "ipad", "galaxy", "redmi", "poco", "xiaomi", "moto", "android", "pixel"]):
-        return "CELULAR / SMARTPHONE"
-    if any(k in h for k in ["desktop", "laptop", "notebook", "pc", "win-", "macbook"]):
-        return "COMPUTADOR / PC"
-    if any(k in h for k in ["ps4", "ps5", "xbox", "nintendo"]):
-        return "VIDEOGAME"
-
-    if porta_aberta(ip, 8008) or porta_aberta(ip, 8001) or porta_aberta(ip, 3000):
-        return "SMART TV / CAST"
-    if porta_aberta(ip, 62078):
-        return "CELULAR (iPhone)"
-    if porta_aberta(ip, 445) or porta_aberta(ip, 135) or porta_aberta(ip, 3389):
-        return "PC WINDOWS"
-    if porta_aberta(ip, 554):
-        return "CAMERA IP / DVR"
-    if porta_aberta(ip, 5555):
-        return "ANDROID / TV BOX"
-
-    if "espressif" in f:
-        return "ESP32 / IoT"
-    if mac_privado or any(k in f for k in ["xiaomi", "motorola", "apple", "samsung"]):
-        return "CELULAR (Provavel)"
-    if any(k in f for k in ["huawei", "zte", "fiberhome", "tp-link", "intelbras", "d-link"]):
-        return "REPETIDOR / ONU"
-
-    return "DISPOSITIVO REDE"
-
-def escanear_portas(ip):
-    abertas = []
-    for porta, nome in PORTAS_ALVO.items():
-        if porta_aberta(ip, porta):
-            abertas.append(f"Porta {porta} ({nome})")
-    return abertas
+        return "—"
 
 def listar_dispositivos(ip_local):
     dispositivos = []
     base = ".".join(ip_local.split(".")[:3]) + "."
     try:
         saida = subprocess.check_output("arp -a", shell=True).decode(errors="ignore")
-        padrao = re.findall(r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:-]{17})", saida)
-        for ip, mac in padrao:
-            if ip.startswith(base) and not ip.endswith(".255") and not ip.endswith(".0"):
+        for ip, mac in re.findall(r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:-]{17})", saida):
+            if ip.startswith(base) and not ip.endswith((".255", ".0")):
                 mac_fmt = mac.replace("-", ":").upper()
-                fab, mac_privado = identificar_fabricante(mac_fmt)
+                fab = identificar_fabricante(mac_fmt)
                 host = obter_hostname(ip)
-                tipo = classificar_dispositivo(ip, host, fab, mac_privado)
-                dispositivos.append((ip, mac_fmt, host, fab, tipo))
+                funcao = "Gateway" if ip.endswith(".1") else "Host LAN"
+                dispositivos.append({"ip": ip, "host": host, "mac": mac_fmt, "fab": fab, "funcao": funcao})
     except Exception:
         pass
     return dispositivos
 
-class RadarHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
+def obter_conexoes_externas():
+    conexoes = []
+    try:
+        saida = subprocess.check_output("netstat -ano -p TCP", shell=True).decode(errors="ignore")
+        for linha in saida.splitlines():
+            partes = linha.split()
+            if len(partes) >= 5 and partes[3] == "ESTABLISHED":
+                local_addr = partes[1]
+                remoto_addr = partes[2]
+                pid = partes[4]
+                if not remoto_addr.startswith(("127.", "192.168.", "10.", "[::1]")):
+                    conexoes.append({"local": local_addr, "remoto": remoto_addr, "pid": pid})
+    except Exception:
         pass
+    return conexoes[:15]
 
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        params = parse_qs(parsed.query)
-        ip_local = obter_ip_local()
-        mensagem_scan = ""
+def investigar_alvo_osint(alvo):
+    alvo = alvo.strip().replace("https://", "").replace("http://", "").split("/").pop(0)
+    try:
+        ip_resolvido = socket.gethostbyname(alvo)
+    except Exception:
+        return {"erro": f"Não foi possível resolver o domínio/IP: {alvo}"}
 
-        if "shutdown" in params:
-            self.send_response(200)
-            self.send_header("Content-type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"<body style='background:#090c10;color:#ff5555;font-family:monospace;padding:30px;'><h1>[//] RADAR DESLIGADO.</h1><p>Pode fechar esta aba.</p></body>")
-            threading.Timer(0.5, lambda: os._exit(0)).start()
-            return
+    dados = consultar_geo_api(ip_resolvido)
+    if not dados:
+        return {"erro": f"Sem dados públicos disponíveis para {ip_resolvido}"}
 
-        if "sweep" in params:
-            varredura_ativa(ip_local)
-            mensagem_scan = "<div class='alert'>[+] Varredura ativa concluida e dispositivos classificados!</div>"
+    return {
+        "alvo": alvo,
+        "ip": ip_resolvido,
+        "local": f"{dados.get('city')}, {dados.get('regionName')} - {dados.get('country')} ({dados.get('countryCode')})",
+        "isp": dados.get("isp"),
+        "asn": dados.get("as"),
+        "coords": f"{dados.get('lat')}, {dados.get('lon')}"
+    }
 
-        if "scan" in params:
-            alvo = params.get("scan", [""]).pop(0)
-            portas = escanear_portas(alvo)
-            lista_p = ", ".join(portas) if portas else "Nenhuma porta comum aberta (Firewall ativo)"
-            mensagem_scan = f"<div class='alert'>[+] Scan de Portas em <b>{alvo}</b>: {lista_p}</div>"
-
-        dispositivos = listar_dispositivos(ip_local)
-        linhas = "".join(
-            f"""<tr>
-                <td><b>{ip}</b></td>
-                <td>{host}</td>
-                <td>{mac}</td>
-                <td>{fab}</td>
-                <td><span class='tag'>{tipo}</span></td>
-                <td><a class='btn-sm' href='/?scan={ip}'>SCAN PORTAS</a></td>
-            </tr>"""
-            for ip, mac, host, fab, tipo in dispositivos
-        ) or "<tr><td colspan='6'>Clique em 'VARREDURA ATIVA' acima para mapear e identificar os aparelhos.</td></tr>"
-
-        html = f"""<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-<meta charset="UTF-8">
-<title>// unseen-dBug :: RADAR v3.0</title>
+# ==========================================
+# UI / DESIGN MINIMALISTA PROFISSIONAL
+# ==========================================
+CSS_BASE = """
 <style>
-  body {{ background:#090c10; color:#00ff9c; font-family:monospace; padding:30px; }}
-  h1 {{ border-bottom:1px solid #00ff9c44; padding-bottom:10px; letter-spacing:2px; }}
-  .box {{ background:#0d1117; border:1px solid #00ff9c33; padding:20px; margin-top:20px; border-radius:6px; }}
-  .alert {{ background:#00ff9c18; border:1px solid #00ff9c; padding:12px; margin-top:15px; border-radius:4px; color:#fff; }}
-  table {{ width:100%; border-collapse:collapse; margin-top:15px; }}
-  th, td {{ text-align:left; padding:10px; border-bottom:1px solid #1f2937; }}
-  th {{ color:#58a6ff; }}
-  .tag {{ background:#00ff9c22; color:#00ff9c; padding:4px 8px; border-radius:4px; font-size:12px; font-weight:bold; }}
-  .btn {{ background:#00ff9c; color:#090c10; padding:10px 18px; text-decoration:none; font-weight:bold; border-radius:4px; display:inline-block; }}
-  .btn-sm {{ background:#1f2937; color:#58a6ff; padding:5px 10px; text-decoration:none; border:1px solid #58a6ff55; border-radius:4px; font-size:12px; }}
-  .btn-sm:hover {{ background:#58a6ff; color:#090c10; }}
-  .btn-red {{ background:#ff555522; color:#ff5555; padding:10px 18px; text-decoration:none; border:1px solid #ff5555; font-weight:bold; border-radius:4px; float:right; }}
-  .btn-red:hover {{ background:#ff5555; color:#fff; }}
-</style>
-</head>
-<body>
-  <h1>// unseen-dBug :: SMART RECON v3.0 <a class="btn-red" href="/?shutdown=1">X DESLIGAR RADAR</a></h1>
-  <div class="box">
-    <p><strong>HOST IP:</strong> {ip_local} &nbsp;|&nbsp; <strong>OS:</strong> {platform.system()} &nbsp;|&nbsp; <strong>DISPOSITIVOS:</strong> {len(dispositivos)}</p>
-    <a class="btn" href="/?sweep=1">VARREDURA ATIVA (IDENTIFICAR TODOS)</a>
-    &nbsp;
-    <a class="btn-sm" href="/">ATUALIZAR LISTA</a>
-    {mensagem_scan}
-  </div>
-  <div class="box">
-    <h3>MAPA INTELIGENTE DE DISPOSITIVOS</h3>
-    <table>
-      <tr><th>ENDERECO IP</th><th>HOSTNAME</th><th>ENDERECO MAC</th><th>FABRICANTE / MAC</th><th>TIPO IDENTIFICADO</th><th>ACAO</th></tr>
-      {linhas}
-    </table>
-  </div>
-</body>
-</html>"""
-        self.send_response(200)
-        self.send_header("Content-type", "text/html; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(html.encode("utf-8"))
+  :root {
+    --bg: #09090b;
+    --surface: #111114;
+    --surface-2: #18181c;
+    --border: #27272a;
+    --text: #f4f4f5;
+    --muted: #a1a1aa;
+    --accent: #3b82f6;
+    --success: #10b981;
+    --danger: #ef4444;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+    line-height: 1.5; -webkit-font-smoothing: antialiased;
+  }
+  .container { max-width: 1180px; margin: 0 auto; padding: 28px 24px; }
+  header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding-bottom: 20px; border-bottom: 1px solid var(--border); margin-bottom: 28px;
+  }
+  .brand { font-size: 16px; font-weight: 600; letter-spacing: -0.02em; display: flex; align-items: center; gap: 10px; }
+  .dot { width: 8px; height: 8px; background: var(--success); border-radius: 50%; box-shadow: 0 0 8px var(--success); }
+  .nav-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 
-if __name__ == "__main__":
-    server = HTTPServer(("127.0.0.1", 9090), RadarHandler)
