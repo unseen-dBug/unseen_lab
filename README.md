@@ -1,4 +1,4 @@
-# unseen-dBug // Network Recon & Telemetry Core (v5.0)
+# unseen-dBug // Network Recon & Telemetry Core (v5.1)
 
 > *"Every system has a blind spot. I'm just looking where no one else does."*
 
@@ -13,7 +13,7 @@ Plataforma minimalista de monitoramento de rede local, telemetria de acessos em 
 
 ### Como Executar
 1. Certifique-se de ter o **Python 3** instalado.
-2. Baixe o arquivo `radar.py` e execute:
+2. Baixe o arquivo `radar.py` e execute no terminal:
    ```bash
    python radar.py
    ```
